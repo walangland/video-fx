@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-import io
+import functools
 import json
 import math
 import os
@@ -85,8 +85,14 @@ LAYER_KEYS = {
     "color", "size", "transform", "keyframes", "effects", "blend", "parent", "mask", "matte", "presets",
     "motion_blur", "shutter_angle", "samples", "duration", "anchor", "position", "scale", "rotation", "opacity",
     "width", "height", "fill", "stroke", "kind", "radius", "points", "inner_radius", "trim", "tracking",
+    "tail", "inherit_opacity",
 }
 TRANSFORM_KEYS = {"anchor", "position", "scale", "rotation", "opacity"}
+KEYFRAME_KEYS = TRANSFORM_KEYS | {"width", "height", "color", "trim", "tracking", "size"}
+COMPOSITION_KEYS = {"id", "name", "width", "height", "fps", "duration", "background", "layers"}
+AUDIO_KEYS = {"id", "source", "start", "in", "out", "end", "duration", "speed", "volume_db", "fade_in", "fade_out", "loop", "mute"}
+SHAPE_KINDS = {"rectangle", "circle", "ellipse", "polygon", "star", "burst", "line", "arrow"}
+FONT_CACHE_SIZE = 96
 _FFPROBE_CACHE: dict[Path, dict[str, Any]] = {}
 
 FONT_CANDIDATES = [
@@ -225,6 +231,7 @@ def animated(layer: dict[str, Any], prop: str, default: Any, local_t: float) -> 
     return default
 
 
+@functools.lru_cache(maxsize=FONT_CACHE_SIZE)
 def load_font(path: str | None, size: int, text: str = "") -> ImageFont.FreeTypeFont:
     candidates = ([path] if path else []) + FONT_CANDIDATES
     for candidate in candidates:
@@ -247,15 +254,6 @@ def contain_cover(image: Image.Image, size: tuple[int, int], fit: str = "contain
     canvas = Image.new("RGBA", size, (0,0,0,0))
     canvas.alpha_composite(resized, ((tw-nw)//2, (th-nh)//2))
     return canvas
-
-
-def decode_video_frame(path: Path, t: float) -> Image.Image:
-    cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(0,t):.6f}", "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"]
-    p = subprocess.run(cmd, capture_output=True)
-    if p.returncode or not p.stdout:
-        die(f"영상 프레임을 읽지 못했습니다: {path}\n{p.stderr.decode(errors='replace').strip()}")
-    import io
-    return Image.open(io.BytesIO(p.stdout)).convert("RGBA")
 
 
 def color_effect(img: Image.Image, fx: dict[str, Any]) -> Image.Image:
@@ -314,7 +312,12 @@ def apply_effects(img: Image.Image, effects: Iterable[dict[str, Any]], frame: in
             edge = out.convert("RGB").filter(ImageFilter.FIND_EDGES); edge.putalpha(out.getchannel("A")); out = edge
         elif kind == "flip":
             direction = str(fx.get("direction", "horizontal"))
-            out = out.transpose(Image.Transpose.FLIP_TOP_BOTTOM if direction == "vertical" else Image.Transpose.FLIP_LEFT_RIGHT)
+            if direction in ("hv", "both"):
+                out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            elif direction in ("v", "vertical"):
+                out = out.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            else:
+                out = out.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         elif kind == "drop_shadow":
             off = fx.get("offset", [8, 8]); radius = float(fx.get("blur", 8))
             shadow = Image.new("RGBA", out.size, parse_color(fx.get("color", "#00000080")))
@@ -347,14 +350,6 @@ def make_text_layer(layer: dict[str, Any], local_t: float) -> Image.Image:
     if "typewriter" in animator:
         rate = float(animator["typewriter"].get("chars_per_second", 15))
         text = text[:max(0, int(local_t*rate))]
-    stagger = animator.get("stagger")
-    if stagger:
-        by = str(stagger.get("by", "character")); interval = max(.001, float(stagger.get("interval", stagger.get("stagger", .04))))
-        units = list(text) if by == "character" else (text.splitlines() if by == "line" else text.split(" "))
-        visible = max(0, min(len(units), int((local_t-float(stagger.get("delay", 0)))/interval)+1))
-        if str(stagger.get("direction", "forward")) == "reverse": units = units[len(units)-visible:]
-        else: units = units[:visible]
-        text = "".join(units) if by == "character" else ("\n" if by == "line" else " ").join(units)
     if "counter" in layer:
         c = layer["counter"]; dur = max(.001, float(c.get("duration", layer.get("end",1)-layer.get("start",0))))
         x = ease_value(str(c.get("ease","linear")), min(1,local_t/dur))
@@ -363,12 +358,13 @@ def make_text_layer(layer: dict[str, Any], local_t: float) -> Image.Image:
         text = f"{value:,}" if "," in fmt else str(value)
         text += fmt.split("0",1)[1] if "0" in fmt else ""
     size = max(1, int(animated(layer, "size", style.get("size", 72), local_t)))
-    font = load_font(style.get("font"), size, text)
+    # Cache by font path/size. Text is only used for the missing-Korean-font diagnostic.
+    font = load_font(style.get("font"), size, "한" if any(ord(ch)>127 for ch in text) else "")
     max_width = int(style.get("max_width", 2000)); tracking = float(animated(layer, "tracking", style.get("tracking", 0), local_t))
     stroke = style.get("stroke", {}); sw = int(stroke.get("width", 0)); spacing = int(size*(float(style.get("line_height",1.15))-1))
     scratch = Image.new("RGBA", (max_width+200, max(size*4,1000))); d = ImageDraw.Draw(scratch)
-    spans = style.get("spans", [])
-    if not spans and not tracking:
+    spans = style.get("spans", []); stagger = animator.get("stagger")
+    if not spans and not tracking and not stagger:
         wrapped = wrap_text(d, text, font, max_width)
         bbox = d.multiline_textbbox((0,0), wrapped, font=font, stroke_width=sw, spacing=spacing)
         w, h = max(1,bbox[2]-bbox[0]+40), max(1,bbox[3]-bbox[1]+40)
@@ -382,28 +378,58 @@ def make_text_layer(layer: dict[str, Any], local_t: float) -> Image.Image:
             sh = sh.filter(ImageFilter.GaussianBlur(float(shadow.get("blur",4)))); img.alpha_composite(sh)
         draw.multiline_text((anchor_x,20), wrapped, font=font, fill=parse_color(animated(layer, "color", style.get("color","#ffffff"), local_t)), anchor=anchor, align=align, spacing=spacing, stroke_width=sw, stroke_fill=parse_color(stroke.get("color","#000000")))
         return img
-    # Character layout preserves original indices so spans can color exact ranges.
-    lines: list[list[tuple[str,int,float]]] = [[]]; widths = [0.0]
+
+    # Lay out the complete string once. Stagger changes each glyph, never line geometry.
+    lines: list[list[tuple[str,int,float,int]]] = [[]]; widths = [0.0]
+    by = str((stagger or {}).get("by", "character"))
+    if by == "line": unit_for = {}; unit=0
+    elif by == "word":
+        unit_for={}; unit=0; in_word=False
+        for i,ch in enumerate(text):
+            if ch.isspace(): in_word=False
+            else:
+                if not in_word: unit += 1; in_word=True
+                unit_for[i]=unit-1
+    else: unit_for={i:i for i,ch in enumerate(text) if ch!='\n'}
+    line_unit=0
     for idx, ch in enumerate(text):
-        if ch == "\n": lines.append([]); widths.append(0.0); continue
+        if ch == "\n": lines.append([]); widths.append(0.0); line_unit += 1; continue
         adv = float(d.textlength(ch, font=font)) + tracking
         if lines[-1] and widths[-1]+adv > max_width:
-            lines.append([]); widths.append(0.0)
-        lines[-1].append((ch, idx, adv)); widths[-1] += adv
+            lines.append([]); widths.append(0.0); line_unit += 1
+        u = line_unit if by=="line" else unit_for.get(idx, 0)
+        lines[-1].append((ch, idx, adv, u)); widths[-1] += adv
     line_h = int(size*float(style.get("line_height",1.15)))
     w = max(1, int(max(widths, default=1)+40)); h = max(1, line_h*len(lines)+40)
-    img = Image.new("RGBA", (w,h)); draw = ImageDraw.Draw(img); align = style.get("align", "center")
+    img = Image.new("RGBA", (w,h)); align = style.get("align", "center")
     base_color = animated(layer, "color", style.get("color", "#ffffff"), local_t)
     def char_color(index: int) -> Any:
         for span in spans:
             lo, hi = span.get("range", [0,0])
             if int(lo) <= index < int(hi): return span.get("color", base_color)
         return base_color
+    max_unit=max((u for row in lines for *_,u in row),default=0)
     for row, chars in enumerate(lines):
-        lw = widths[row]; x = 20.0 if align == "left" else (w-lw-20 if align == "right" else (w-lw)/2)
-        y = 20+row*line_h
-        for ch, idx, adv in chars:
-            draw.text((x,y), ch, font=font, fill=parse_color(char_color(idx)), stroke_width=sw, stroke_fill=parse_color(stroke.get("color","#000000")))
+        lw = widths[row]; x = 20.0 if align == "left" else (w-lw-20 if align == "right" else (w-lw)/2); y = 20+row*line_h
+        for ch, idx, adv, unit_index in chars:
+            opacity=100.0; oy=0.0; glyph_scale=100.0
+            if stagger:
+                order=max_unit-unit_index if str(stagger.get("direction","forward"))=="reverse" else unit_index
+                interval=max(.0001,float(stagger.get("interval",stagger.get("stagger",.04))))
+                transition=max(.0001,float(stagger.get("duration",interval)))
+                q=(local_t-float(stagger.get("delay",0))-order*interval)/transition
+                q=ease_value(str(stagger.get("ease","linear")),min(1,max(0,q)))
+                op_pair=stagger.get("opacity",[0,100]); off_pair=stagger.get("offset_y",[0,0]); sc_pair=stagger.get("scale",[100,100])
+                opacity=float(lerp(op_pair[0],op_pair[-1],q)); oy=float(lerp(off_pair[0],off_pair[-1],q)); glyph_scale=float(lerp(sc_pair[0],sc_pair[-1],q))
+            color=list(parse_color(char_color(idx))); color[3]=round(color[3]*max(0,min(100,opacity))/100)
+            if glyph_scale==100:
+                ImageDraw.Draw(img).text((x,y+oy),ch,font=font,fill=tuple(color),stroke_width=sw,stroke_fill=parse_color(stroke.get("color","#000000")))
+            elif opacity>0:
+                bb=d.textbbox((0,0),ch,font=font,stroke_width=sw); gw=max(1,bb[2]-bb[0]+2*sw+4); gh=max(1,bb[3]-bb[1]+2*sw+4)
+                glyph=Image.new("RGBA",(gw,gh)); gd=ImageDraw.Draw(glyph)
+                gd.text((sw+2-bb[0],sw+2-bb[1]),ch,font=font,fill=tuple(color),stroke_width=sw,stroke_fill=parse_color(stroke.get("color","#000000")))
+                factor=max(.01,glyph_scale/100); glyph=glyph.resize((max(1,round(gw*factor)),max(1,round(gh*factor))),RESAMPLING.LANCZOS)
+                img.alpha_composite(glyph,(round(x+(adv-glyph.width)/2),round(y+oy+(size-glyph.height)/2)))
             x += adv
     return img
 
@@ -460,61 +486,102 @@ def blend(base: Image.Image, over: Image.Image, pos: tuple[int,int], mode: str) 
     mask=layer.getchannel("A"); return Image.composite(mixed,base,mask)
 
 
+def _unknown(obj: dict[str, Any], allowed: set[str], where: str) -> None:
+    bad=set(obj)-allowed
+    if bad: die(f"프로젝트 값이 잘못되었습니다 ({where}): 알 수 없는 속성 {sorted(bad)[0]!r}")
+
+
 def validate_project_data(data: dict[str, Any]) -> None:
+    _unknown(data,{"version","main","compositions","audio"},"root")
+    for ai,audio in enumerate(data.get("audio",[])):
+        _unknown(audio,AUDIO_KEYS,f"audio.{ai}")
+        if not audio.get("source"): die(f"프로젝트 값이 잘못되었습니다 (audio.{ai}.source): 필수 값입니다")
+    effect_keys={
+        "color":{"type","contrast","saturation","brightness","gamma","temperature"}, "blur":{"type","radius","amount"},
+        "sharpen":{"type","amount"}, "glow":{"type","radius","amount"}, "vignette":{"type","amount"},
+        "grain":{"type","amount","seed"}, "noise":{"type","amount","seed"}, "invert":{"type"}, "sepia":{"type"},
+        "edge":{"type"}, "flip":{"type","direction"}, "drop_shadow":{"type","offset","blur","color"},
+        "wiggle":{"type","freq","amp","seed","until"},
+    }
     for ci, comp in enumerate(data.get("compositions", [])):
+        _unknown(comp,COMPOSITION_KEYS,f"compositions.{ci}")
         ids: set[str] = set()
         for li, layer in enumerate(comp.get("layers", [])):
-            where=f"compositions.{ci}.layers.{li}"
-            kind=layer.get("type")
+            where=f"compositions.{ci}.layers.{li}"; kind=layer.get("type")
             if kind not in LAYER_TYPES: die(f"프로젝트 값이 잘못되었습니다 ({where}.type): 허용되지 않은 레이어 종류 {kind!r}")
-            unknown=set(layer)-LAYER_KEYS
-            if unknown: die(f"프로젝트 값이 잘못되었습니다 ({where}): 알 수 없는 속성 {sorted(unknown)[0]!r}")
+            _unknown(layer,LAYER_KEYS,where)
             if kind in ("video","image","audio") and not layer.get("source"): die(f"프로젝트 값이 잘못되었습니다 ({where}.source): 필수 값입니다")
-            transform=layer.get("transform",{})
-            bad_t=set(transform)-TRANSFORM_KEYS
-            if bad_t: die(f"프로젝트 값이 잘못되었습니다 ({where}.transform): 알 수 없는 속성 {sorted(bad_t)[0]!r}")
+            if layer.get("tail","hold") not in {"hold","loop","error"}: die(f"프로젝트 값이 잘못되었습니다 ({where}.tail): hold, loop, error 중 하나여야 합니다")
+            transform=layer.get("transform",{}); _unknown(transform,TRANSFORM_KEYS,f"{where}.transform")
             for prop, frames in layer.get("keyframes",{}).items():
-                if prop not in TRANSFORM_KEYS|{"width","height","color","blur","trim","tracking","size","progress"}:
-                    die(f"프로젝트 값이 잘못되었습니다 ({where}.keyframes): 알 수 없는 속성 {prop!r}")
-                if not isinstance(frames,list) or any(not isinstance(k,dict) or "t" not in k or "v" not in k for k in frames):
-                    die(f"프로젝트 값이 잘못되었습니다 ({where}.keyframes.{prop}): 각 키프레임에 t와 v가 필요합니다")
+                if prop not in KEYFRAME_KEYS: die(f"프로젝트 값이 잘못되었습니다 ({where}.keyframes): 구현되지 않았거나 알 수 없는 속성 {prop!r}")
+                if not isinstance(frames,list) or any(not isinstance(k,dict) or "t" not in k or "v" not in k or set(k)-{"t","v","ease"} for k in frames):
+                    die(f"프로젝트 값이 잘못되었습니다 ({where}.keyframes.{prop}): 각 키프레임에는 t, v, 선택적 ease만 허용됩니다")
             for ei, fx in enumerate(layer.get("effects",[])):
-                if fx.get("type") not in EFFECT_TYPES: die(f"프로젝트 값이 잘못되었습니다 ({where}.effects.{ei}.type): 지원하지 않는 효과 {fx.get('type')!r}")
-            if layer.get("blend","normal") not in {"normal","multiply","screen","overlay","add","soft-light"}:
-                die(f"프로젝트 값이 잘못되었습니다 ({where}.blend): 지원하지 않는 합성 모드")
+                ft=fx.get("type")
+                if ft not in EFFECT_TYPES: die(f"프로젝트 값이 잘못되었습니다 ({where}.effects.{ei}.type): 지원하지 않는 효과 {ft!r}")
+                _unknown(fx,effect_keys[ft],f"{where}.effects.{ei}")
+            if layer.get("blend","normal") not in {"normal","multiply","screen","overlay","add","soft-light"}: die(f"프로젝트 값이 잘못되었습니다 ({where}.blend): 지원하지 않는 합성 모드")
+            shape=layer.get("shape",{}) if isinstance(layer.get("shape",{}),dict) else {}
+            if kind=="shape":
+                _unknown(shape,{"width","height","fill","color","stroke","kind","shape","radius","points","inner_radius","trim","points_xy","line_width","arrow_size"},f"{where}.shape")
+                sk=shape.get("kind",shape.get("shape",layer.get("kind","rectangle")))
+                if sk not in SHAPE_KINDS:die(f"프로젝트 값이 잘못되었습니다 ({where}.shape.kind): 지원하지 않는 도형 {sk!r}")
+            for owner,name in ((layer.get("style",{}),"style"),(shape.get("stroke",{}),"shape.stroke")):
+                if isinstance(owner,dict):
+                    allowed={"font","size","color","stroke","shadow","align","max_width","line_height","tracking","spans"} if name=="style" else {"width","color"}
+                    _unknown(owner,allowed,f"{where}.{name}")
+            style=layer.get("style",{})
+            if isinstance(style,dict):
+                if isinstance(style.get("stroke"),dict):_unknown(style["stroke"],{"width","color"},f"{where}.style.stroke")
+                if isinstance(style.get("shadow"),dict):_unknown(style["shadow"],{"offset","color","blur"},f"{where}.style.shadow")
+                for si,span in enumerate(style.get("spans",[])):_unknown(span,{"range","color","font","size","weight"},f"{where}.style.spans.{si}")
+            if isinstance(layer.get("counter"),dict):_unknown(layer["counter"],{"from","to","duration","ease","format"},f"{where}.counter")
+            if isinstance(layer.get("animator"),dict):
+                _unknown(layer["animator"],{"typewriter","stagger"},f"{where}.animator")
+                if isinstance(layer["animator"].get("typewriter"),dict):_unknown(layer["animator"]["typewriter"],{"chars_per_second"},f"{where}.animator.typewriter")
+                if isinstance(layer["animator"].get("stagger"),dict):_unknown(layer["animator"]["stagger"],{"by","interval","stagger","delay","direction","duration","opacity","offset_y","scale","ease"},f"{where}.animator.stagger")
+            masks=layer.get("mask",[]);masks=masks if isinstance(masks,list) else ([masks] if masks else [])
+            for mi,mask in enumerate(masks):_unknown(mask,{"type","box","points","feather","invert","progress_keyframes"},f"{where}.mask.{mi}")
             lid=str(layer.get("id",f"layer_{li}"))
-            if lid in ids: die(f"프로젝트 값이 잘못되었습니다 ({where}.id): 중복 id {lid!r}")
+            if lid in ids:die(f"프로젝트 값이 잘못되었습니다 ({where}.id): 중복 id {lid!r}")
             ids.add(lid)
 
 
+
 def apply_layer_presets(layer: dict[str, Any], comp_duration: float, base: Path|None = None) -> dict[str, Any]:
-    out=copy.deepcopy(layer); k=out.setdefault("keyframes",{}); transform=out.setdefault("transform",{})
+    out=copy.deepcopy(layer); transform=out.setdefault("transform",{}); modifiers=[]
     start=float(out.get("start",0)); dur=max(0.001,layer_end(out,comp_duration)-start)
+    def mod(prop:str,frames:list[dict[str,Any]],operation:str)->None:modifiers.append({"prop":prop,"frames":frames,"operation":operation})
     for item in out.get("presets",[]):
         name=str(item.get("name")); t=float(item.get("t",0)); amount=float(item.get("amount",100))
-        if name=="zoom_punch": k.setdefault("scale",[{"t":t,"v":[110,110],"ease":"ease-out"},{"t":t+.22,"v":[100,100]}])
-        elif name=="slow_push": k.setdefault("scale",[{"t":t,"v":[100,100]},{"t":t+dur,"v":[105,105],"ease":"linear"}])
+        if name=="zoom_punch":mod("scale",[{"t":t,"v":[110,110],"ease":"ease-out"},{"t":t+.22,"v":[100,100]}],"multiply")
+        elif name=="slow_push":mod("scale",[{"t":t,"v":[100,100]},{"t":t+dur,"v":[105,105],"ease":"linear"}],"multiply")
         elif name=="pop_in":
-            k.setdefault("scale",[{"t":t,"v":[0,0],"ease":"back"},{"t":t+.16,"v":[115,115],"ease":"ease-out"},{"t":t+.28,"v":[100,100]}]); k.setdefault("opacity",[{"t":t,"v":0},{"t":t+.1,"v":100}])
+            mod("scale",[{"t":t,"v":[0,0],"ease":"back"},{"t":t+.16,"v":[115,115],"ease":"ease-out"},{"t":t+.28,"v":[100,100]}],"multiply")
+            mod("opacity",[{"t":t,"v":0},{"t":t+.1,"v":100}],"multiply")
         elif name=="stamp":
-            k.setdefault("scale",[{"t":t,"v":[150,150],"ease":"ease-out"},{"t":t+.18,"v":[100,100]}]); out.setdefault("effects",[]).append({"type":"wiggle","freq":28,"amp":8,"seed":17,"until":t+.22})
-        elif name=="bar_fill": transform.setdefault("anchor",[0,.5]); k.setdefault("scale",[{"t":t,"v":[0,100],"ease":"ease-out"},{"t":t+.35,"v":[amount,100]}])
-        elif name=="crossfade": k.setdefault("opacity",[{"t":t,"v":0},{"t":t+.25,"v":100}])
-        elif name=="slide_up":
-            pos=transform.get("position",[0,0]); k.setdefault("position",[{"t":t,"v":[pos[0],pos[1]+80],"ease":"ease-out"},{"t":t+.3,"v":pos}])
-        elif name=="flash": k.setdefault("opacity",[{"t":t,"v":100},{"t":t+.1,"v":0}])
-        elif name=="shake": out.setdefault("effects",[]).append({"type":"wiggle","freq":18,"amp":float(item.get("amp",10)),"seed":int(item.get("seed",1))})
-        elif name=="wipe": out["mask"]={"type":"rectangle","progress_keyframes":[{"t":t,"v":0},{"t":t+.35,"v":100}],"feather":item.get("feather",0)}
+            mod("scale",[{"t":t,"v":[150,150],"ease":"ease-out"},{"t":t+.18,"v":[100,100]}],"multiply");out.setdefault("effects",[]).append({"type":"wiggle","freq":28,"amp":8,"seed":17,"until":t+.22})
+        elif name=="bar_fill":transform.setdefault("anchor",[0,.5]);mod("scale",[{"t":t,"v":[0,100],"ease":"ease-out"},{"t":t+.35,"v":[amount,100]}],"multiply")
+        elif name=="crossfade":mod("opacity",[{"t":t,"v":0},{"t":t+.25,"v":100}],"multiply")
+        elif name=="slide_up":mod("position",[{"t":t,"v":[0,80],"ease":"ease-out"},{"t":t+.3,"v":[0,0]}],"add")
+        elif name=="flash":mod("opacity",[{"t":t,"v":100},{"t":t+.1,"v":0}],"multiply")
+        elif name=="shake":out.setdefault("effects",[]).append({"type":"wiggle","freq":18,"amp":float(item.get("amp",10)),"seed":int(item.get("seed",1))})
+        elif name=="wipe":out["mask"]={"type":"rectangle","progress_keyframes":[{"t":t,"v":0},{"t":t+.35,"v":100}],"feather":item.get("feather",0)}
         else:
             preset_path=(base/"presets"/f"{name}.json") if base else None
             if not preset_path or not preset_path.exists():die(f"알 수 없는 프리셋: {name}")
             try:spec=json.loads(preset_path.read_text(encoding="utf-8"))
             except (OSError,json.JSONDecodeError) as exc:die(f"프리셋을 읽을 수 없습니다: {preset_path}: {exc}")
-            out.setdefault("effects",[]).extend(copy.deepcopy(spec.get("effects",[])));transform.update(copy.deepcopy(spec.get("transform",{})))
+            out.setdefault("effects",[]).extend(copy.deepcopy(spec.get("effects",[])))
+            for prop,value in spec.get("transform",{}).items():
+                neutral=[100,100] if prop=="scale" else (100 if prop=="opacity" else ([0,0] if prop=="position" else 0))
+                mod(prop,[{"t":t,"v":neutral},{"t":t,"v":value}],"multiply" if prop in ("scale","opacity") else "add")
             for prop,frames in spec.get("keyframes",{}).items():
                 shifted=copy.deepcopy(frames)
                 for frame in shifted:frame["t"]=float(frame["t"])+t
-                k.setdefault(prop,shifted)
+                mod(prop,shifted,"multiply" if prop in ("scale","opacity") else "add")
+    out["_preset_modifiers"]=modifiers
     return out
 
 
@@ -542,48 +609,46 @@ class Project:
 
 
 class VideoDecoder:
-    """Sequential raw-video decoder; restarts only after a seek or skipped frame."""
-    def __init__(self, path: Path, fps: float, speed: float, start_in: float, output_size: tuple[int,int], fit: str|None):
-        self.path=path; self.fps=fps; self.speed=speed; self.start_in=start_in; self.output_size=output_size; self.fit=fit
-        info=ffprobe(path); stream=next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"),None)
-        if not stream: die(f"영상 스트림이 없습니다: {path}")
-        sw,sh=int(stream["width"]),int(stream["height"]); tw,th=output_size
-        if fit: self.w,self.h=tw,th
-        else: self.w,self.h=sw,sh
-        self.proc: subprocess.Popen[bytes]|None=None; self.next_index=0
-
+    """Sequential raw-video decoder with hold/loop/error end-of-stream policies."""
+    def __init__(self,path:Path,fps:float,speed:float,start_in:float,output_size:tuple[int,int],fit:str|None,tail:str="hold"):
+        self.path=path;self.fps=fps;self.speed=speed;self.start_in=start_in;self.output_size=output_size;self.fit=fit;self.tail=tail
+        info=ffprobe(path);stream=next((x for x in info.get("streams",[]) if x.get("codec_type")=="video"),None)
+        if not stream:die(f"영상 스트림이 없습니다: {path}")
+        sw,sh=int(stream["width"]),int(stream["height"]);tw,th=output_size;self.w,self.h=((tw,th) if fit else (sw,sh))
+        self.proc:subprocess.Popen[bytes]|None=None;self.next_index=0;self.last_frame:Image.Image|None=None;self.eof_index:int|None=None
+        self.loop_frames=max(1,math.ceil(max(0,media_duration(path)-start_in)*fps/max(speed,.0001)))
     def _filters(self)->str:
-        rate=self.fps/max(.0001,self.speed); filters=[f"fps={rate:.12g}"]
-        tw,th=self.output_size
-        if self.fit=="stretch": filters.append(f"scale={tw}:{th}")
-        elif self.fit=="contain": filters += [f"scale={tw}:{th}:force_original_aspect_ratio=decrease",f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=0x00000000"]
-        elif self.fit=="cover": filters += [f"scale={tw}:{th}:force_original_aspect_ratio=increase",f"crop={tw}:{th}"]
+        rate=self.fps/max(.0001,self.speed);filters=[f"fps={rate:.12g}"];tw,th=self.output_size
+        if self.fit=="stretch":filters.append(f"scale={tw}:{th}")
+        elif self.fit=="contain":filters += [f"scale={tw}:{th}:force_original_aspect_ratio=decrease",f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=0x00000000"]
+        elif self.fit=="cover":filters += [f"scale={tw}:{th}:force_original_aspect_ratio=increase",f"crop={tw}:{th}"]
         return ",".join(filters)
-
-    def restart(self, index: int) -> None:
-        self.close(); seek=self.start_in+index*self.speed/self.fps
+    def restart(self,index:int)->None:
+        self.close();seek=self.start_in+index*self.speed/self.fps
         cmd=["ffmpeg","-v","error","-ss",f"{seek:.9f}","-i",str(self.path),"-an","-sn","-vf",self._filters(),"-f","rawvideo","-pix_fmt","rgba","-"]
-        self.proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE); self.next_index=index
-
-    def read(self, index: int) -> Image.Image:
-        if self.proc is None or index!=self.next_index: self.restart(index)
-        assert self.proc and self.proc.stdout
-        need=self.w*self.h*4; data=bytearray()
+        self.proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE);self.next_index=index
+    def read(self,index:int)->Image.Image:
+        if self.eof_index is not None and index>=self.eof_index:
+            if self.tail=="hold" and self.last_frame is not None:return self.last_frame.copy()
+            if self.tail=="loop":index=index%self.loop_frames;self.eof_index=None
+            else:die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}")
+        if self.proc is None or index!=self.next_index:self.restart(index)
+        assert self.proc and self.proc.stdout;need=self.w*self.h*4;data=bytearray()
         while len(data)<need:
             chunk=self.proc.stdout.read(need-len(data))
-            if not chunk: break
+            if not chunk:break
             data.extend(chunk)
         if len(data)!=need:
-            err=self.proc.stderr.read().decode(errors="replace") if self.proc.stderr else ""
-            self.close(); die(f"영상 프레임을 읽지 못했습니다: {self.path}\n{err.strip()}")
-        self.next_index+=1
-        return Image.frombytes("RGBA",(self.w,self.h),bytes(data))
-
+            self.eof_index=index;self.close()
+            if self.tail=="hold" and self.last_frame is not None:return self.last_frame.copy()
+            if self.tail=="loop" and self.loop_frames>0:return self.read(index%self.loop_frames)
+            die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}")
+        self.next_index+=1;self.last_frame=Image.frombytes("RGBA",(self.w,self.h),bytes(data));return self.last_frame.copy()
     def close(self)->None:
         if self.proc:
-            if self.proc.stdout: self.proc.stdout.close()
-            if self.proc.stderr: self.proc.stderr.close()
-            if self.proc.poll() is None: self.proc.terminate()
+            if self.proc.stdout:self.proc.stdout.close()
+            if self.proc.stderr:self.proc.stderr.close()
+            if self.proc.poll() is None:self.proc.terminate()
             try:self.proc.wait(timeout=1)
             except subprocess.TimeoutExpired:self.proc.kill();self.proc.wait()
         self.proc=None
@@ -595,7 +660,8 @@ class Renderer:
         self.w=max(1,round(self.comp["width"]*scale)); self.h=max(1,round(self.comp["height"]*scale)); self.fps=float(self.comp["fps"])
         self.comp["layers"]=[apply_layer_presets(x,float(self.comp["duration"]),self.base) for x in self.comp.get("layers",[])]
         self.layers_by_id={str(x.get("id",f"layer_{i}")):x for i,x in enumerate(self.comp["layers"])}
-        self.image_cache: dict[Path,Image.Image]={}; self.video_decoders: dict[str,VideoDecoder]={}; self.precomps=shared if shared is not None else {}
+        self.image_cache: dict[Path,Image.Image]={}; self.layer_cache: dict[str,Image.Image]={}; self.video_decoders: dict[str,VideoDecoder]={}; self.precomps=shared if shared is not None else {}
+        self.matte_ids={str(m.get("layer")) if isinstance(m,dict) else str(m) for x in self.comp["layers"] for m in [x.get("matte")] if m}
         self.precomps[self.comp["id"]]=self
 
     def close(self)->None:
@@ -611,15 +677,20 @@ class Renderer:
             path=resolve_path(self.base,layer["source"]); key=str(layer.get("id",id(layer)))
             if not path.exists(): die(f"영상 파일을 찾을 수 없습니다: {path}")
             if key not in self.video_decoders:
-                self.video_decoders[key]=VideoDecoder(path,self.fps,float(layer.get("speed",1)),float(layer.get("in",0)),(self.w,self.h),layer.get("fit"))
+                self.video_decoders[key]=VideoDecoder(path,self.fps,float(layer.get("speed",1)),float(layer.get("in",0)),(self.w,self.h),layer.get("fit"),str(layer.get("tail","hold")))
             return self.video_decoders[key].read(max(0,round(t*self.fps)))
         if kind=="image":
             path=resolve_path(self.base,layer["source"])
             if not path.exists(): die(f"이미지 파일을 찾을 수 없습니다: {path}")
             if path not in self.image_cache:self.image_cache[path]=Image.open(path).convert("RGBA")
             return self.image_cache[path].copy()
-        if kind=="text":return make_text_layer(layer,t)
-        if kind=="shape":return make_shape_layer(layer,t)
+        if kind in ("text","shape"):
+            dynamic=bool(layer.get("keyframes") or layer.get("animator") or layer.get("counter"))
+            key=str(layer.get("id",id(layer)))
+            if not dynamic and key in self.layer_cache:return self.layer_cache[key].copy()
+            image=make_text_layer(layer,t) if kind=="text" else make_shape_layer(layer,t)
+            if not dynamic:self.layer_cache[key]=image.copy()
+            return image
         if kind=="solid":
             size=layer.get("size",[self.comp["width"],self.comp["height"]]); return Image.new("RGBA",(max(1,round(float(size[0])*self.scale)),max(1,round(float(size[1])*self.scale))),parse_color(animated(layer,"color",layer.get("color","#000000"),t)))
         if kind=="comp":
@@ -629,18 +700,25 @@ class Renderer:
         return Image.new("RGBA",(1,1),(0,0,0,0))
 
     def transform_values(self,layer:dict[str,Any],local:float,seen:set[str]|None=None)->tuple[list[float],list[float],float,float]:
-        pos=list(animated(layer,"position",[self.comp["width"]/2,self.comp["height"]/2],local)); sc=list(animated(layer,"scale",[100,100],local)); rot=float(animated(layer,"rotation",0,local)); op=float(animated(layer,"opacity",100,local))
+        pos=list(animated(layer,"position",[self.comp["width"]/2,self.comp["height"]/2],local));sc=list(animated(layer,"scale",[100,100],local));rot=float(animated(layer,"rotation",0,local));op=float(animated(layer,"opacity",100,local))
+        for modifier in layer.get("_preset_modifiers",[]):
+            prop=modifier["prop"];holder={"keyframes":{prop:modifier["frames"]}};neutral=[100,100] if prop=="scale" else (100 if prop=="opacity" else ([0,0] if prop=="position" else 0));value=animated(holder,prop,neutral,local)
+            if prop=="scale":sc=[sc[0]*float(value[0])/100,sc[1]*float(value[1])/100]
+            elif prop=="opacity":op*=float(value)/100
+            elif prop=="position":pos=[pos[0]+float(value[0]),pos[1]+float(value[1])]
+            elif prop=="rotation":rot+=float(value)
         for fx in layer.get("effects",[]):
             if fx.get("type")=="wiggle" and local<=float(fx.get("until",1e20)):
-                seed=float(fx.get("seed",1)); freq=float(fx.get("freq",12)); amp=float(fx.get("amp",8)); pos[0]+=math.sin((local*freq+seed)*6.2831853)*amp; pos[1]+=math.sin((local*freq*1.173+seed*2.31)*6.2831853)*amp
+                seed=float(fx.get("seed",1));freq=float(fx.get("freq",12));amp=float(fx.get("amp",8));pos[0]+=math.sin((local*freq+seed)*6.2831853)*amp;pos[1]+=math.sin((local*freq*1.173+seed*2.31)*6.2831853)*amp
         parent_id=layer.get("parent")
         if parent_id:
             seen=set() if seen is None else seen
             if parent_id in seen:die(f"부모 레이어 순환 참조: {parent_id}")
-            seen.add(parent_id); parent=self.layers_by_id.get(str(parent_id))
+            seen.add(parent_id);parent=self.layers_by_id.get(str(parent_id))
             if not parent:die(f"부모 레이어를 찾을 수 없습니다: {parent_id}")
-            plocal=local+float(layer.get("start",0))-float(parent.get("start",0)); pp,ps,pr,po=self.transform_values(parent,plocal,seen)
-            x,y=pos[0]*ps[0]/100,pos[1]*ps[1]/100; rad=math.radians(pr); pos=[pp[0]+x*math.cos(rad)-y*math.sin(rad),pp[1]+x*math.sin(rad)+y*math.cos(rad)]; sc=[sc[0]*ps[0]/100,sc[1]*ps[1]/100];rot+=pr;op*=po/100
+            plocal=local+float(layer.get("start",0))-float(parent.get("start",0));pp,ps,pr,po=self.transform_values(parent,plocal,seen)
+            x,y=pos[0]*ps[0]/100,pos[1]*ps[1]/100;rad=math.radians(pr);pos=[pp[0]+x*math.cos(rad)-y*math.sin(rad),pp[1]+x*math.sin(rad)+y*math.cos(rad)];sc=[sc[0]*ps[0]/100,sc[1]*ps[1]/100];rot+=pr
+            if layer.get("inherit_opacity"):op*=po/100
         return pos,sc,rot,op
 
     def apply_mask(self,img:Image.Image,layer:dict[str,Any],local:float)->Image.Image:
@@ -663,54 +741,82 @@ class Renderer:
             alpha=ImageChops.multiply(alpha,m)
         img.putalpha(alpha);return img
 
-    def place_layer(self,img:Image.Image,layer:dict[str,Any],local:float)->Image.Image:
-        img=self.apply_mask(img,layer,local); pos,scale,rotation,opacity=self.transform_values(layer,local)
-        preview_scale = 1.0 if layer.get("type") == "video" and layer.get("fit") else self.scale
+    def prepare_layer(self,img:Image.Image,layer:dict[str,Any],local:float)->tuple[Image.Image,tuple[int,int]]:
+        img=self.apply_mask(img,layer,local);pos,scale,rotation,opacity=self.transform_values(layer,local)
+        preview_scale=1.0 if layer.get("type")=="video" and layer.get("fit") else self.scale
         sx,sy=float(scale[0])/100*preview_scale,float(scale[1])/100*preview_scale
         img=img.resize((max(1,round(img.width*sx)),max(1,round(img.height*sy))),RESAMPLING.LANCZOS)
-        anchor=animated(layer,"anchor",[.5,.5],local); ax=float(anchor[0])*img.width; ay=float(anchor[1])*img.height
-        halfx=math.ceil(max(ax,img.width-ax))+2; halfy=math.ceil(max(ay,img.height-ay))+2
-        centered=Image.new("RGBA",(halfx*2,halfy*2)); centered.alpha_composite(img,(round(halfx-ax),round(halfy-ay)))
+        anchor=animated(layer,"anchor",[.5,.5],local);ax=float(anchor[0])*img.width;ay=float(anchor[1])*img.height
+        halfx=math.ceil(max(ax,img.width-ax))+2;halfy=math.ceil(max(ay,img.height-ay))+2
+        centered=Image.new("RGBA",(halfx*2,halfy*2));centered.alpha_composite(img,(round(halfx-ax),round(halfy-ay)))
         if rotation:centered=centered.rotate(-rotation,expand=True,resample=RESAMPLING.BICUBIC)
-        if layer.get("motion_blur"):centered=centered.filter(ImageFilter.GaussianBlur(max(.5,float(layer.get("shutter_angle",180))/180)))
         if opacity<100:centered.putalpha(centered.getchannel("A").point(lambda a:int(a*max(0,opacity)/100)))
-        full=Image.new("RGBA",(self.w,self.h)); full.alpha_composite(centered,(round(float(pos[0])*self.scale-centered.width/2),round(float(pos[1])*self.scale-centered.height/2)))
-        return full
+        return centered,(round(float(pos[0])*self.scale-centered.width/2),round(float(pos[1])*self.scale-centered.height/2))
+
+    def full_surface(self,small:Image.Image,pos:tuple[int,int])->Image.Image:
+        full=Image.new("RGBA",(self.w,self.h));full.alpha_composite(small,pos);return full
+
+    def place_layer(self,img:Image.Image,layer:dict[str,Any],local:float)->Image.Image:
+        small,pos=self.prepare_layer(img,layer,local);return self.full_surface(small,pos)
+
+    def motion_blur_surface(self,img:Image.Image,layer:dict[str,Any],local:float)->Image.Image|None:
+        if not layer.get("motion_blur"):return None
+        shutter=max(0,float(layer.get("shutter_angle",180)))/360/self.fps;earlier=max(0,local-shutter)
+        a=self.transform_values(layer,earlier)[:3];b=self.transform_values(layer,local)[:3]
+        if all(abs(float(x)-float(y))<1e-6 for av,bv in zip(a,b) for x,y in zip(av if isinstance(av,list) else [av],bv if isinstance(bv,list) else [bv])):return None
+        samples=max(2,int(layer.get("samples",8)));acc=np.zeros((self.h,self.w,4),dtype=np.float32)
+        for i in range(samples):
+            st=earlier+(local-earlier)*(i/(samples-1));small,pos=self.prepare_layer(img,layer,st);acc+=np.asarray(self.full_surface(small,pos),dtype=np.float32)
+        return Image.fromarray(np.uint8(np.clip(acc/samples,0,255)),"RGBA")
 
     def render_frame(self,t:float,comp_id:str|None=None)->Image.Image:
         if comp_id and comp_id!=self.comp["id"]:
             if comp_id not in self.precomps:self.precomps[comp_id]=Renderer(self.project,comp_id,self.scale,self.precomps)
             return self.precomps[comp_id].render_frame(t)
-        canvas=Image.new("RGBA",(self.w,self.h),parse_color(self.comp.get("background","#000000"))); surfaces:dict[str,Image.Image]={}
+        canvas=Image.new("RGBA",(self.w,self.h),parse_color(self.comp.get("background","#000000")));surfaces:dict[str,Image.Image]={}
         for i,layer in enumerate(self.comp.get("layers",[])):
-            if layer.get("hidden") or layer.get("type") in ("null","audio"):continue
-            start=float(layer.get("start",0));end=layer_end(layer,float(self.comp["duration"]))
+            lid=str(layer.get("id",f"layer_{i}"));start=float(layer.get("start",0));end=layer_end(layer,float(self.comp["duration"]))
+            if layer.get("type")=="video" and t>=end and lid in self.video_decoders:
+                self.video_decoders.pop(lid).close()
+            matte_source=lid in self.matte_ids
+            if (layer.get("hidden") and not matte_source) or layer.get("type") in ("null","audio"):continue
             if not(start<=t<end):continue
             local=t-start
-            if layer["type"]=="adjustment":canvas=apply_effects(canvas,layer.get("effects",[]),round(t*self.fps));continue
+            if layer["type"]=="adjustment":
+                if not layer.get("hidden"):canvas=apply_effects(canvas,layer.get("effects",[]),round(t*self.fps))
+                continue
             img=self.source_image(layer,local)
             if layer.get("fit") and layer["type"]!="video":img=contain_cover(img,(self.w,self.h),layer["fit"])
-            img=apply_effects(img,[x for x in layer.get("effects",[]) if x.get("type")!="wiggle"],round(t*self.fps));surface=self.place_layer(img,layer,local)
+            img=apply_effects(img,[x for x in layer.get("effects",[]) if x.get("type")!="wiggle"],round(t*self.fps))
+            motion=self.motion_blur_surface(img,layer,local)
+            need_full=motion is not None or matte_source or bool(layer.get("matte")) or layer.get("blend","normal")!="normal"
+            if motion is not None:surface=motion;small=None;pos=(0,0)
+            else:
+                small,pos=self.prepare_layer(img,layer,local);surface=self.full_surface(small,pos) if need_full else None
             matte=layer.get("matte")
             if matte:
                 if isinstance(matte,str):mid,mtype=matte,"alpha"
                 else:mid,mtype=str(matte.get("layer")),str(matte.get("type","alpha"))
                 if mid not in surfaces:die(f"매트 레이어가 대상보다 먼저 렌더되어야 합니다: {mid}")
-                mask=surfaces[mid].convert("L") if mtype=="luma" else surfaces[mid].getchannel("A")
+                assert surface is not None;mask=surfaces[mid].convert("L") if mtype.startswith("luma") else surfaces[mid].getchannel("A")
                 if "invert" in mtype:mask=ImageChops.invert(mask)
                 surface.putalpha(ImageChops.multiply(surface.getchannel("A"),mask))
-            lid=str(layer.get("id",f"layer_{i}"));surfaces[lid]=surface
-            canvas=blend(canvas,surface,(0,0),str(layer.get("blend","normal")))
+            if matte_source:
+                if surface is None:surface=self.full_surface(small,pos) # type: ignore[arg-type]
+                surfaces[lid]=surface
+                continue
+            if layer.get("hidden"):continue
+            if surface is not None:canvas=blend(canvas,surface,(0,0),str(layer.get("blend","normal")))
+            else:canvas.alpha_composite(small,pos) # type: ignore[arg-type]
         return canvas
 
     def audio_inputs_and_filter(self,start:float,duration:float)->tuple[list[str],str,str|None]:
         args:list[str]=[];chains:list[str]=[];labels:list[str]=[];entries:list[tuple[dict[str,Any],bool]]=[]
-        entries += [(x,True) for x in self.project.data.get("audio",[])]
+        entries += [(x,True) for x in self.project.data.get("audio",[]) if not x.get("mute")]
         for layer in self.comp.get("layers",[]):
-            if layer.get("type")=="audio" and layer.get("source"):entries.append((layer,True))
+            if layer.get("type")=="audio" and layer.get("source") and not layer.get("mute"):entries.append((layer,True))
             if layer.get("type")=="video" and not layer.get("mute",False) and layer.get("source"):
-                a={"source":layer["source"],"start":layer.get("start",0),"in":layer.get("in",0),"out":layer.get("out"),"volume_db":layer.get("volume_db",0),"speed":layer.get("speed",1),"end":layer_end(layer,float(self.comp["duration"]))}
-                entries.append((a,False))
+                entries.append(({"source":layer["source"],"start":layer.get("start",0),"in":layer.get("in",0),"out":layer.get("out"),"volume_db":layer.get("volume_db",0),"speed":layer.get("speed",1),"end":layer_end(layer,float(self.comp["duration"])),"fade_in":layer.get("fade_in"),"fade_out":layer.get("fade_out")},False))
         input_index=1
         for a,explicit in entries:
             path=resolve_path(self.base,a["source"])
@@ -719,23 +825,24 @@ class Renderer:
                 if explicit:die(f"프로젝트 audio 항목에 오디오 스트림이 없습니다: {path}")
                 continue
             args += ["-i",str(path)];delay=max(0,float(a.get("start",0))-start);trim=max(0,start-float(a.get("start",0)))+float(a.get("in",0));speed=float(a.get("speed",1))
+            if speed<=0:die("오디오 speed는 0보다 커야 합니다.")
             pieces=[f"atrim=start={trim:.9f}"]
-            if a.get("out") is not None:pieces[0]+=f":end={float(a['out']):.9f}"
+            out_value=a.get("out");clip_source=float(media_duration(path) if out_value is None else out_value)-float(a.get("in",0));clip_duration=max(0,clip_source/speed)
+            if a.get("duration") is not None:clip_duration=min(clip_duration,float(a["duration"]))
+            if a.get("end") is not None:clip_duration=min(clip_duration,max(0,float(a["end"])-float(a.get("start",0))))
             if speed!=1:
                 remain=speed
                 while remain>2:pieces.append("atempo=2");remain/=2
                 while remain<.5:pieces.append("atempo=.5");remain*=2
                 if abs(remain-1)>.000001:pieces.append(f"atempo={remain:.9f}")
+            pieces.append(f"atrim=duration={clip_duration:.9f}")
             pieces.append(f"volume={float(a.get('volume_db',0))}dB")
-            out_value=a.get("out");clip_source=(float(media_duration(path) if out_value is None else out_value)-float(a.get("in",0)))
-            clip_duration=max(0,clip_source/speed)
-            if a.get("end") is not None:clip_duration=min(clip_duration,max(0,float(a["end"])-float(a.get("start",0))))
             if a.get("fade_in"):pieces.append(f"afade=t=in:st=0:d={float(a['fade_in']):.9f}")
             if a.get("fade_out"):pieces.append(f"afade=t=out:st={max(0,clip_duration-float(a['fade_out'])):.9f}:d={float(a['fade_out']):.9f}")
             pieces += [f"adelay={round(delay*1000)}|{round(delay*1000)}",f"atrim=duration={duration:.9f}","asetpts=N/SR/TB"]
             label=f"a{len(labels)}";chains.append(f"[{input_index}:a]{','.join(pieces)}[{label}]");labels.append(f"[{label}]");input_index+=1
         if not labels:return args,"",None
-        chains.append("".join(labels)+f"amix=inputs={len(labels)}:normalize=0:duration=longest[aout]")
+        chains.append("".join(labels)+f"amix=inputs={len(labels)}:normalize=0:duration=longest,apad,atrim=duration={duration:.9f}[aout]")
         return args,";".join(chains),"[aout]"
 
     def render_contact_sheet(self,times:list[float],out:Path,columns:int=3)->None:
@@ -750,6 +857,7 @@ class Renderer:
         layer=visible[0];tr=layer.get("transform",{})
         if layer.get("effects") or layer.get("keyframes") or layer.get("presets") or layer.get("mask") or layer.get("matte") or layer.get("parent") or layer.get("motion_blur"):return None
         if layer.get("blend","normal")!="normal" or float(layer.get("start",0))!=0:return None
+        if abs(layer_end(layer,float(self.comp["duration"]))-float(self.comp["duration"]))>1e-6:return None
         if tr.get("anchor",[.5,.5])!=[.5,.5] or tr.get("scale",[100,100])!=[100,100] or float(tr.get("rotation",0))!=0 or float(tr.get("opacity",100))!=100:return None
         if tr.get("position",[self.comp["width"]/2,self.comp["height"]/2])!=[self.comp["width"]/2,self.comp["height"]/2]:return None
         return layer
@@ -761,6 +869,10 @@ class Renderer:
         elif fit=="cover":vf=f"scale={self.w}:{self.h}:force_original_aspect_ratio=increase,crop={self.w}:{self.h}"
         else:vf=f"scale={self.w}:{self.h}:force_original_aspect_ratio=decrease,pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2:color=black"
         vf+=f",setpts=PTS/{speed:.9f},fps={fps_arg}"
+        available=max(0,(media_duration(path)-seek)/speed);needed=end-start
+        if needed>available and layer.get("tail","hold")=="hold":vf+=f",tpad=stop_mode=clone:stop_duration={needed-available+.1:.9f}"
+        elif needed>available and layer.get("tail")=="loop":vf+=f",loop=loop=-1:size={max(1,round(available*self.fps))}:start=0"
+        elif needed>available and layer.get("tail")=="error":die(f"영상 원본이 레이어보다 짧습니다: {path}")
         cmd=["ffmpeg","-y","-v","error","-ss",f"{seek:.9f}","-i",str(path)]+audio_args+["-vf",vf]
         if afilter:cmd += ["-filter_complex",afilter]
         cmd += ["-map","0:v:0"]
@@ -796,7 +908,7 @@ class Renderer:
             cmd += ["-map","0:v:0"]
             if alabel:cmd += ["-map",alabel]
             if out.suffix.lower()==".mov":cmd += ["-c:v","prores_ks","-profile:v","4","-pix_fmt","yuva444p10le"]
-            else:cmd += ["-c:v","libx264","-crf","18","-preset","medium","-pix_fmt","yuv420p","-movflags","+faststart"]
+            else:cmd += ["-c:v","libx264","-crf","18","-preset","veryfast","-pix_fmt","yuv420p","-movflags","+faststart"]
             if alabel:cmd += ["-c:a","aac","-b:a","192k"]
             cmd += ["-t",f"{end-start:.9f}",str(out)];proc=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=subprocess.PIPE);assert proc.stdin is not None
             try:
@@ -868,16 +980,46 @@ def import_srt(project_path:Path,srt_path:Path,out:Path,font:str|None=None)->Non
     out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(project.data,ensure_ascii=False,indent=2),encoding="utf-8")
 
 
-def import_timing(project_path:Path,timing_path:Path,out:Path)->None:
-    project=Project.load(project_path);raw=json.loads(timing_path.read_text(encoding="utf-8-sig"));cuts=raw.get("cuts",raw) if isinstance(raw,dict) else raw
-    if not isinstance(cuts,list):die("timing JSON은 배열 또는 cuts 배열이어야 합니다.")
-    comp=project.data["compositions"][0]
-    for i,cut in enumerate(cuts):
-        if not isinstance(cut,dict) or "source" not in cut or "start" not in cut:die(f"timing 항목 {i}에 source와 start가 필요합니다.")
-        layer={"id":str(cut.get("id",f"cut_{i+1}")),"type":"video","source":cut["source"],"start":cut["start"],"in":cut.get("in",0),"speed":cut.get("speed",1),"fit":cut.get("fit","cover")}
-        if "out" in cut:layer["out"]=cut["out"]
-        if "end" in cut:layer["end"]=cut["end"]
-        comp["layers"].append(layer)
+def import_timing(project_path:Path,timing_path:Path,out:Path,base:Path|None=None,scenes_path:Path|None=None)->None:
+    project=Project.load(project_path)
+    try:raw=json.loads(timing_path.read_text(encoding="utf-8-sig"))
+    except (OSError,json.JSONDecodeError) as exc:die(f"timing JSON을 읽을 수 없습니다: {exc}")
+    comp=project.data["compositions"][0];root=(base.resolve() if base else timing_path.resolve().parent)
+    def source_value(value:str)->str:
+        q=Path(value).expanduser();return str(q if q.is_absolute() else (root/q).resolve())
+    if isinstance(raw,dict) and ("chunks" in raw or "lines" in raw):
+        if "total" in raw:comp["duration"]=float(raw["total"])
+        chunks=raw.get("chunks",[]);lines=raw.get("lines",[])
+        if not isinstance(chunks,list) or not isinstance(lines,list):die("timing JSON의 chunks와 lines는 배열이어야 합니다.")
+        audio=project.data.setdefault("audio",[])
+        for i,chunk in enumerate(chunks):
+            if not isinstance(chunk,dict) or "file" not in chunk or "start" not in chunk:die(f"timing chunks.{i}에 file과 start가 필요합니다.")
+            item={"id":f"timing_audio_{i+1}","source":source_value(str(chunk["file"])),"start":float(chunk["start"])}
+            if "duration" in chunk:item["duration"]=float(chunk["duration"]);item["end"]=float(chunk["start"])+float(chunk["duration"])
+            audio.append(item)
+        scenes=None
+        if scenes_path:
+            try:scenes=json.loads(scenes_path.read_text(encoding="utf-8-sig"))
+            except (OSError,json.JSONDecodeError) as exc:die(f"scenes JSON을 읽을 수 없습니다: {exc}")
+            if not isinstance(scenes,dict):die("scenes JSON은 줄 id를 파일 경로에 대응한 객체여야 합니다.")
+        for i,line in enumerate(lines):
+            if not isinstance(line,dict) or "start" not in line or "end" not in line:die(f"timing lines.{i}에 start와 end가 필요합니다.")
+            lid=str(line.get("id",i+1));a=float(line["start"]);b=float(line["end"])
+            if scenes is not None:
+                src=scenes.get(lid,scenes.get(str(i+1)))
+                if src is None:die(f"scenes JSON에 줄 {lid!r}의 영상이 없습니다.")
+                comp["layers"].append({"id":f"scene_{lid}","type":"video","source":source_value(str(src)),"start":a,"end":b,"fit":"cover","tail":"hold"})
+            else:
+                comp["layers"].append({"id":f"line_{lid}","type":"text","start":a,"end":b,"text":str(line.get("text","")),"style":{"size":72,"color":"#ffffff","stroke":{"width":5,"color":"#000000"},"align":"center","max_width":int(comp["width"]*.9)},"transform":{"position":[comp["width"]/2,comp["height"]*.82]}})
+    else:
+        cuts=raw.get("cuts",raw) if isinstance(raw,dict) else raw
+        if not isinstance(cuts,list):die("timing JSON은 배열, cuts 배열 또는 total/chunks/lines 형식이어야 합니다.")
+        for i,cut in enumerate(cuts):
+            if not isinstance(cut,dict) or "source" not in cut or "start" not in cut:die(f"timing 항목 {i}에 source와 start가 필요합니다.")
+            layer={"id":str(cut.get("id",f"cut_{i+1}")),"type":"video","source":cut["source"],"start":cut["start"],"in":cut.get("in",0),"speed":cut.get("speed",1),"fit":cut.get("fit","cover")}
+            if "out" in cut:layer["out"]=cut["out"]
+            if "end" in cut:layer["end"]=cut["end"]
+            comp["layers"].append(layer)
     out.parent.mkdir(parents=True,exist_ok=True);out.write_text(json.dumps(project.data,ensure_ascii=False,indent=2),encoding="utf-8")
 
 
@@ -889,7 +1031,7 @@ def build_render_parser()->argparse.ArgumentParser:
 
 def build_legacy_parser()->argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="video_fx",description="레이어·키프레임 기반 영상 합성 엔진\n프로젝트 모드: video_fx render project.json -o out.mp4")
-    p.add_argument("legacy_input",metavar="input",nargs="?");p.add_argument("legacy_output",metavar="output",nargs="?");p.add_argument("--preset",choices=sorted(PRESETS));p.add_argument("--list-presets",action="store_true");p.add_argument("--text");p.add_argument("--font");p.add_argument("--text-size",type=int,default=72);p.add_argument("--text-color",default="#ffffff");p.add_argument("--stroke-width",type=int,default=4);p.add_argument("--stroke-color",default="#000000");p.add_argument("--fade-in",type=float,default=0);p.add_argument("--fade-out",type=float,default=0);p.add_argument("--speed",type=float,default=1);p.add_argument("--fit",choices=["contain","cover","stretch"],default="contain");p.add_argument("--size","--resize",dest="size");p.add_argument("--blur",type=float,default=0);p.add_argument("--vignette",type=float,default=0);p.add_argument("--brightness",type=float,default=0);p.add_argument("--contrast",type=float,default=1);p.add_argument("--saturation",type=float,default=1);p.add_argument("--grayscale",action="store_true");p.add_argument("--sepia",action="store_true");p.add_argument("--invert",action="store_true");p.add_argument("--edge",action="store_true");p.add_argument("--flip",choices=["horizontal","vertical"])
+    p.add_argument("legacy_input",metavar="input",nargs="?");p.add_argument("legacy_output",metavar="output",nargs="?");p.add_argument("--preset",choices=sorted(PRESETS));p.add_argument("--list-presets",action="store_true");p.add_argument("--text");p.add_argument("--font");p.add_argument("--text-size",type=int,default=72);p.add_argument("--text-color",default="#ffffff");p.add_argument("--stroke-width",type=int,default=4);p.add_argument("--stroke-color",default="#000000");p.add_argument("--fade-in",type=float,default=0);p.add_argument("--fade-out",type=float,default=0);p.add_argument("--speed",type=float,default=1);p.add_argument("--fit",choices=["contain","cover","stretch"],default="contain");p.add_argument("--size","--resize",dest="size");p.add_argument("--blur",type=float,default=0);p.add_argument("--vignette",type=float,default=0);p.add_argument("--brightness",type=float,default=0);p.add_argument("--contrast",type=float,default=1);p.add_argument("--saturation",type=float,default=1);p.add_argument("--grayscale",action="store_true");p.add_argument("--sepia",action="store_true");p.add_argument("--invert",action="store_true");p.add_argument("--edge",action="store_true");p.add_argument("--flip",choices=["h","v","hv","horizontal","vertical"])
     return p
 
 
@@ -898,7 +1040,7 @@ def main(argv:list[str]|None=None)->int:
     if argv and argv[0] in ("import-srt","import_srt"):
         p=argparse.ArgumentParser(prog="video_fx import-srt");p.add_argument("project");p.add_argument("srt");p.add_argument("-o","--output",required=True);p.add_argument("--font");a=p.parse_args(argv[1:]);import_srt(Path(a.project),Path(a.srt),Path(a.output),a.font);return 0
     if argv and argv[0] in ("import-timing","import_timing"):
-        p=argparse.ArgumentParser(prog="video_fx import-timing");p.add_argument("project");p.add_argument("timing");p.add_argument("-o","--output",required=True);a=p.parse_args(argv[1:]);import_timing(Path(a.project),Path(a.timing),Path(a.output));return 0
+        p=argparse.ArgumentParser(prog="video_fx import-timing");p.add_argument("project");p.add_argument("timing");p.add_argument("-o","--output",required=True);p.add_argument("--base",type=Path);p.add_argument("--scenes",type=Path);a=p.parse_args(argv[1:]);import_timing(Path(a.project),Path(a.timing),Path(a.output),a.base,a.scenes);return 0
     if argv and argv[0]=="render":
         args=build_render_parser().parse_args(argv[1:])
         project=Project.load(Path(args.project)); renderer=Renderer(project,args.comp,args.scale); out=Path(args.output)
