@@ -609,14 +609,18 @@ class Project:
 
 
 class VideoDecoder:
-    """Sequential raw-video decoder with hold/loop/error end-of-stream policies."""
+    """Sequential raw-video decoder with accurate hold/loop/error tail policies."""
     def __init__(self,path:Path,fps:float,speed:float,start_in:float,output_size:tuple[int,int],fit:str|None,tail:str="hold"):
         self.path=path;self.fps=fps;self.speed=speed;self.start_in=start_in;self.output_size=output_size;self.fit=fit;self.tail=tail
         info=ffprobe(path);stream=next((x for x in info.get("streams",[]) if x.get("codec_type")=="video"),None)
         if not stream:die(f"영상 스트림이 없습니다: {path}")
         sw,sh=int(stream["width"]),int(stream["height"]);tw,th=output_size;self.w,self.h=((tw,th) if fit else (sw,sh))
-        self.proc:subprocess.Popen[bytes]|None=None;self.next_index=0;self.last_frame:Image.Image|None=None;self.eof_index:int|None=None
+        self.proc:subprocess.Popen[bytes]|None=None;self.next_index=0
+        self.last_frame:Image.Image|None=None;self.last_index:int|None=None;self.tail_frame:Image.Image|None=None
         self.loop_frames=max(1,math.ceil(max(0,media_duration(path)-start_in)*fps/max(speed,.0001)))
+        # A short loop is cheaper and more reliable when its first pass is retained.
+        self.loop_cache:dict[int,Image.Image]={}
+        self.cache_loop=tail=="loop" and self.loop_frames*self.w*self.h*4<=256*1024*1024
     def _filters(self)->str:
         rate=self.fps/max(.0001,self.speed);filters=[f"fps={rate:.12g}"];tw,th=self.output_size
         if self.fit=="stretch":filters.append(f"scale={tw}:{th}")
@@ -627,11 +631,8 @@ class VideoDecoder:
         self.close();seek=self.start_in+index*self.speed/self.fps
         cmd=["ffmpeg","-v","error","-ss",f"{seek:.9f}","-i",str(self.path),"-an","-sn","-vf",self._filters(),"-f","rawvideo","-pix_fmt","rgba","-"]
         self.proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE);self.next_index=index
-    def read(self,index:int)->Image.Image:
-        if self.eof_index is not None and index>=self.eof_index:
-            if self.tail=="hold" and self.last_frame is not None:return self.last_frame.copy()
-            if self.tail=="loop":index=index%self.loop_frames;self.eof_index=None
-            else:die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}")
+    def _read_source(self,index:int)->Image.Image|None:
+        if self.cache_loop and index in self.loop_cache:return self.loop_cache[index].copy()
         if self.proc is None or index!=self.next_index:self.restart(index)
         assert self.proc and self.proc.stdout;need=self.w*self.h*4;data=bytearray()
         while len(data)<need:
@@ -639,11 +640,41 @@ class VideoDecoder:
             if not chunk:break
             data.extend(chunk)
         if len(data)!=need:
-            self.eof_index=index;self.close()
-            if self.tail=="hold" and self.last_frame is not None:return self.last_frame.copy()
-            if self.tail=="loop" and self.loop_frames>0:return self.read(index%self.loop_frames)
-            die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}")
-        self.next_index+=1;self.last_frame=Image.frombytes("RGBA",(self.w,self.h),bytes(data));return self.last_frame.copy()
+            self.close();return None
+        frame=Image.frombytes("RGBA",(self.w,self.h),bytes(data));self.next_index+=1
+        self.last_frame=frame;self.last_index=index
+        if index==self.loop_frames-1:self.tail_frame=frame.copy()
+        if self.cache_loop:self.loop_cache[index]=frame.copy()
+        return frame.copy()
+    def _read_tail(self)->Image.Image:
+        if self.tail_frame is not None:return self.tail_frame.copy()
+        # Do not use last_frame here: a preview/contact-sheet may have last read
+        # any arbitrary earlier time. Seek specifically to the source's tail.
+        frame=self._read_source(self.loop_frames-1)
+        if frame is not None:self.tail_frame=frame.copy();return frame
+        # Duration metadata can round one frame high. Walk back only until an
+        # actual final frame is found and make that the canonical loop length.
+        for index in range(self.loop_frames-2,max(-1,self.loop_frames-7),-1):
+            frame=self._read_source(index)
+            if frame is not None:
+                self.loop_frames=index+1;self.tail_frame=frame.copy();return frame
+        die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}");return Image.new("RGBA",(self.w,self.h))
+    def read(self,index:int)->Image.Image:
+        if index<0:index=0
+        if index>=self.loop_frames:
+            if self.tail=="hold":return self._read_tail()
+            if self.tail=="error":die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}")
+            index%=self.loop_frames
+        frame=self._read_source(index)
+        if frame is not None:return frame
+        # If sequential decoding exposed slightly shorter media than metadata,
+        # correct the canonical length once and apply the requested policy.
+        if self.last_frame is not None and self.last_index==index-1:
+            self.loop_frames=max(1,index);self.tail_frame=self.last_frame.copy()
+            if self.tail=="hold":return self.tail_frame.copy()
+            if self.tail=="loop":return self.read(index%self.loop_frames)
+        if self.tail=="hold":return self._read_tail()
+        die(f"영상 프레임을 읽지 못했습니다(원본 끝): {self.path}");return Image.new("RGBA",(self.w,self.h))
     def close(self)->None:
         if self.proc:
             if self.proc.stdout:self.proc.stdout.close()
@@ -745,11 +776,15 @@ class Renderer:
         img=self.apply_mask(img,layer,local);pos,scale,rotation,opacity=self.transform_values(layer,local)
         preview_scale=1.0 if layer.get("type")=="video" and layer.get("fit") else self.scale
         sx,sy=float(scale[0])/100*preview_scale,float(scale[1])/100*preview_scale
-        img=img.resize((max(1,round(img.width*sx)),max(1,round(img.height*sy))),RESAMPLING.LANCZOS)
+        target=(max(1,round(img.width*sx)),max(1,round(img.height*sy)))
+        if target!=img.size:img=img.resize(target,RESAMPLING.LANCZOS)
         anchor=animated(layer,"anchor",[.5,.5],local);ax=float(anchor[0])*img.width;ay=float(anchor[1])*img.height
+        if not rotation:
+            if opacity<100:img.putalpha(img.getchannel("A").point(lambda a:int(a*max(0,opacity)/100)))
+            return img,(round(float(pos[0])*self.scale-ax),round(float(pos[1])*self.scale-ay))
         halfx=math.ceil(max(ax,img.width-ax))+2;halfy=math.ceil(max(ay,img.height-ay))+2
         centered=Image.new("RGBA",(halfx*2,halfy*2));centered.alpha_composite(img,(round(halfx-ax),round(halfy-ay)))
-        if rotation:centered=centered.rotate(-rotation,expand=True,resample=RESAMPLING.BICUBIC)
+        centered=centered.rotate(-rotation,expand=True,resample=RESAMPLING.BICUBIC)
         if opacity<100:centered.putalpha(centered.getchannel("A").point(lambda a:int(a*max(0,opacity)/100)))
         return centered,(round(float(pos[0])*self.scale-centered.width/2),round(float(pos[1])*self.scale-centered.height/2))
 
@@ -856,6 +891,7 @@ class Renderer:
         if len(visible)!=1 or visible[0].get("type")!="video":return None
         layer=visible[0];tr=layer.get("transform",{})
         if layer.get("effects") or layer.get("keyframes") or layer.get("presets") or layer.get("mask") or layer.get("matte") or layer.get("parent") or layer.get("motion_blur"):return None
+        if layer.get("tail")=="loop" and float(layer.get("in",0))!=0:return None
         if layer.get("blend","normal")!="normal" or float(layer.get("start",0))!=0:return None
         if abs(layer_end(layer,float(self.comp["duration"]))-float(self.comp["duration"]))>1e-6:return None
         if tr.get("anchor",[.5,.5])!=[.5,.5] or tr.get("scale",[100,100])!=[100,100] or float(tr.get("rotation",0))!=0 or float(tr.get("opacity",100))!=100:return None
@@ -863,17 +899,25 @@ class Renderer:
         return layer
 
     def render_fast(self,layer:dict[str,Any],out:Path,start:float,end:float)->None:
-        path=resolve_path(self.base,layer["source"]);speed=float(layer.get("speed",1));seek=float(layer.get("in",0))+start*speed
-        audio_args,afilter,alabel=self.audio_inputs_and_filter(start,end-start);fps_arg=str(Fraction(str(self.comp["fps"])).limit_denominator(1001));fit=layer.get("fit","contain")
+        path=resolve_path(self.base,layer["source"]);speed=float(layer.get("speed",1));start_in=float(layer.get("in",0));tail=str(layer.get("tail","hold"));needed=end-start
+        source_duration=media_duration(path);source_span=max(0,source_duration-start_in);seek=start_in+start*speed;loop_input: list[str]=[]
+        if tail=="loop":
+            if source_span<=0:die(f"반복할 영상 프레임이 없습니다: {path}")
+            seek=start_in+(start*speed)%source_span
+            if start_in==0:loop_input=["-stream_loop","-1"]
+        elif tail=="hold" and seek>=source_duration:
+            # A range that starts after EOF still needs one real tail frame for tpad.
+            seek=max(start_in,source_duration-speed/self.fps)
+        audio_args,afilter,alabel=self.audio_inputs_and_filter(start,needed);fps_arg=str(Fraction(str(self.comp["fps"])).limit_denominator(1001));fit=layer.get("fit","contain")
         if fit=="stretch":vf=f"scale={self.w}:{self.h}"
         elif fit=="cover":vf=f"scale={self.w}:{self.h}:force_original_aspect_ratio=increase,crop={self.w}:{self.h}"
         else:vf=f"scale={self.w}:{self.h}:force_original_aspect_ratio=decrease,pad={self.w}:{self.h}:(ow-iw)/2:(oh-ih)/2:color=black"
         vf+=f",setpts=PTS/{speed:.9f},fps={fps_arg}"
-        available=max(0,(media_duration(path)-seek)/speed);needed=end-start
-        if needed>available and layer.get("tail","hold")=="hold":vf+=f",tpad=stop_mode=clone:stop_duration={needed-available+.1:.9f}"
-        elif needed>available and layer.get("tail")=="loop":vf+=f",loop=loop=-1:size={max(1,round(available*self.fps))}:start=0"
-        elif needed>available and layer.get("tail")=="error":die(f"영상 원본이 레이어보다 짧습니다: {path}")
-        cmd=["ffmpeg","-y","-v","error","-ss",f"{seek:.9f}","-i",str(path)]+audio_args+["-vf",vf]
+        available=max(0,(source_duration-seek)/speed)
+        if tail=="loop" and start_in==0:available=needed
+        if needed>available and tail=="hold":vf+=f",tpad=stop_mode=clone:stop_duration={needed-available+.1:.9f}"
+        elif needed>available and tail=="error":die(f"영상 원본이 레이어보다 짧습니다: {path}")
+        cmd=["ffmpeg","-y","-v","error"]+loop_input+["-ss",f"{seek:.9f}","-i",str(path)]+audio_args+["-vf",vf]
         if afilter:cmd += ["-filter_complex",afilter]
         cmd += ["-map","0:v:0"]
         if alabel:cmd += ["-map",alabel]

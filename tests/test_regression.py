@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-ENGINE=Path(__file__).parents[2]/"video_fx.py"
+ROOT=Path(__file__).parents[1]
+ENGINE=ROOT/"video_fx.py"
 M=runpy.run_path(str(ENGINE))
 
 def run(*args,check=True):
@@ -118,3 +119,78 @@ def test_srt_34_lines(tmp_path):
     for i in range(34):blocks.append(f"{i+1}\n00:00:{i:02},000 --> 00:00:{i:02},900\ncaption {i+1}")
     srt=tmp_path/"captions.srt";srt.write_text("\n\n".join(blocks));out=tmp_path/"srt.json";run("import-srt",base,srt,"-o",out)
     assert len(json.loads(out.read_text())["compositions"][0]["layers"])==34
+
+
+def numbered_media(tmp_path,duration=4,size="320x240",rate=30):
+    source=tmp_path/f"numbered_{duration}.mkv"
+    subprocess.run(["ffmpeg","-y","-v","error","-f","lavfi","-i",rf"color=s={size}:r={rate},format=rgb24,geq=r='mod(N\,32)*8':g='floor(N/32)*64':b=0","-t",str(duration),"-c:v","libx264rgb","-qp","0",str(source)],check=True)
+    return source
+
+def frame_number(image,x=None,y=None):
+    x=image.width//2 if x is None else x;y=image.height//2 if y is None else y
+    r,g,_=image.getpixel((x,y))[:3]
+    return round(r/8)+round(g/64)*32
+
+def test_tail_hold_random_access_preview_range_and_contact_sheet(tmp_path):
+    source=numbered_media(tmp_path,duration=4)
+    layer={"id":"v","type":"video","source":str(source),"start":0,"end":5,"tail":"hold"}
+    p=write_project(tmp_path,base_project(320,240,30,5,[layer]),"hold_random.json")
+    preview=tmp_path/"preview.png";run("render",p,"--preview-frame",4.5,"-o",preview)
+    assert frame_number(Image.open(preview))==119
+    ranged=tmp_path/"range.mp4";run("render",p,"--range","4.5-5","-o",ranged)
+    first=tmp_path/"range_first.png"
+    subprocess.run(["ffmpeg","-y","-v","error","-i",str(ranged),"-frames:v","1",str(first)],check=True)
+    assert frame_number(Image.open(first))==119
+    sheet=tmp_path/"sheet.png";run("render",p,"--contact-sheet","1,3,4.5","-o",sheet)
+    image=Image.open(sheet);thumb_w=image.width//3
+    assert frame_number(image,thumb_w*2+thumb_w//2,image.height//2)==119
+
+def test_tail_loop_mapping_and_speed(tmp_path):
+    source=numbered_media(tmp_path,duration=1)
+    timings={}
+    for tail in ("hold","loop"):
+        samples=[];elapsed=[]
+        for _ in range(2):
+            decoder=M["VideoDecoder"](source,30,1,0,(320,240),None,tail);start=time.perf_counter();values={}
+            for index in range(120):
+                frame=decoder.read(index)
+                if index in (29,30,31,95):values[index]=frame_number(frame)
+            elapsed.append(time.perf_counter()-start);decoder.close();samples.append(values)
+        timings[tail]=min(elapsed)
+        if tail=="loop":assert samples[-1]=={29:29,30:0,31:1,95:5}
+        else:assert samples[-1]=={29:29,30:29,31:29,95:29}
+    assert timings["loop"]<=timings["hold"]*1.5
+
+
+@pytest.mark.slow
+def test_1080x1920_composite_performance(tmp_path):
+    source,_,_=media(tmp_path,duration=2,size="1080x1920",rate=30)
+    layers=[
+        {"id":"v","type":"video","source":str(source),"start":0,"end":2,"fit":"cover"},
+        {"id":"bar1","type":"shape","start":0,"end":2,"shape":{"width":800,"height":100,"fill":"#e53935"},"position":[540,1450]},
+        {"id":"bar2","type":"shape","start":0,"end":2,"shape":{"kind":"circle","width":240,"height":240,"fill":"#ffd54f"},"position":[850,400]},
+        {"id":"title","type":"text","start":0,"end":2,"text":"VIDEO FX","style":{"size":96,"color":"#ffffff"},"position":[540,300]},
+        {"id":"price","type":"text","start":0,"end":2,"text":"12,250","style":{"size":72,"color":"#ffffff"},"position":[540,1550]},
+    ]
+    p=write_project(tmp_path,base_project(1080,1920,30,2,layers),"performance.json")
+    out=tmp_path/"performance.mp4";started=time.perf_counter();run("render",p,"-o",out);elapsed=time.perf_counter()-started
+    assert out.exists() and abs(float(probe(out)["format"]["duration"])-2)<=1/30
+    assert elapsed<=6.0,f"2초 성능 기준 초과: {elapsed:.2f}s"
+
+def test_readme_commands_smoke(tmp_path):
+    readme=(ROOT/"README.md").read_text(encoding="utf-8")
+    commands=[line.strip() for line in readme.splitlines() if line.strip().startswith("python video_fx.py")]
+    assert len(commands)>=4
+    assert any(" render " in x for x in commands)
+    assert any("import-srt" in x for x in commands)
+    assert any("import-timing" in x for x in commands)
+    source,_,_=media(tmp_path,duration=.2,size="80x60",rate=10)
+    legacy=tmp_path/"legacy.mp4";run(source,legacy,"--grayscale","--blur",1,"--fade-in",.05,"--fade-out",.05)
+    base=write_project(tmp_path,base_project(80,60,10,.2,[]),"project.json")
+    rendered=tmp_path/"rendered.mp4";run("render",base,"-o",rendered)
+    srt=tmp_path/"captions.srt";srt.write_text("1\n00:00:00,000 --> 00:00:00,100\ncaption\n")
+    captioned=tmp_path/"with-captions.json";run("import-srt",base,srt,"-o",captioned)
+    timing=tmp_path/"timing.json";timing.write_text(json.dumps({"total":.2,"chunks":[],"lines":[{"id":1,"start":0,"end":.2,"text":"caption"}]}))
+    scenes=tmp_path/"scenes.json";scenes.write_text(json.dumps({"1":"scene_01.mp4"}))
+    imported=tmp_path/"sh02.json";run("import-timing",base,timing,"--base",tmp_path,"--scenes",scenes,"-o",imported)
+    assert all(x.exists() for x in (legacy,rendered,captioned,imported))
